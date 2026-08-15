@@ -3,11 +3,11 @@ import { z } from "zod";
 
 import type { Chapter, TranscriptMeta } from "./book-types";
 
+const toneSchema = z.enum(["entretien", "magazine", "pedagogique", "essai"]);
+
 export const getTranscript = createServerFn({ method: "POST" })
   .inputValidator((data: unknown) =>
-    z
-      .object({ url: z.string().min(5), lang: z.string().optional() })
-      .parse(data),
+    z.object({ url: z.string().min(5), lang: z.string().optional() }).parse(data),
   )
   .handler(async ({ data }): Promise<TranscriptMeta> => {
     const { fetchTranscript } = await import("./youtube.server");
@@ -24,8 +24,10 @@ export const writeChapter = createServerFn({ method: "POST" })
         bookTitle: z.string(),
         sourceLang: z.string(),
         targetLang: z.string().nullable(),
+        tone: toneSchema,
         previousSpeakers: z.array(z.string()).max(12),
         previousEnding: z.string().max(400),
+        knownTerms: z.array(z.string()).max(40),
       })
       .parse(data),
   )
@@ -43,6 +45,7 @@ export const writeFrontMatter = createServerFn({ method: "POST" })
         chapterTitles: z.array(z.string()),
         excerpt: z.string(),
         targetLang: z.string().nullable(),
+        tone: toneSchema,
       })
       .parse(data),
   )
