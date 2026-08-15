@@ -1,6 +1,6 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { createFileRoute, useRouter } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ArrowRight,
   BookOpen,
@@ -9,15 +9,29 @@ import {
   FileText,
   Languages,
   Loader2,
+  Lock,
   RotateCcw,
   Sparkles,
   Wand2,
   XCircle,
 } from "lucide-react";
 
-import { TARGET_LANGUAGES, type Book, type Chapter } from "@/lib/book-types";
-import { buildEpub, buildPdf, downloadBlob, slugify } from "@/lib/ebook-export";
+import {
+  TARGET_LANGUAGES,
+  TONES,
+  chapterWordCount,
+  formatPrice,
+  mergeGlossary,
+  type Book,
+  type Chapter,
+  type ToneId,
+  type TranscriptChunk,
+} from "@/lib/book-types";
 import { getTranscript, writeChapter, writeFrontMatter } from "@/lib/podcast.functions";
+import { saveBookFn } from "@/lib/books.functions";
+import { BookReader } from "@/components/BookReader";
+import { SiteHeader } from "@/components/SiteHeader";
+import { useAuth } from "@/hooks/useAuth";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -26,51 +40,90 @@ export const Route = createFileRoute("/")({
       {
         name: "description",
         content:
-          "Collez un lien YouTube : transcription, mise en forme éditoriale par IA, traduction optionnelle et export EPUB ou PDF prêt pour Kindle.",
+          "Collez un lien YouTube : aperçu gratuit du premier chapitre, puis 2,89 € pour le livre complet en EPUB et PDF, édité par IA et traduit si besoin.",
       },
       { property: "og:title", content: "Podcastly — Votre podcast devient un livre" },
       {
         property: "og:description",
         content:
-          "Un lien YouTube, un clic : votre épisode devient un eBook structuré en chapitres, traduit si besoin, téléchargeable en EPUB ou PDF.",
+          "Un lien YouTube, un aperçu gratuit, 2,89 € pour l'eBook complet : chapitres, notes de lecture, glossaire, EPUB et PDF.",
       },
     ],
   }),
   component: Home,
 });
 
-type Phase = "idle" | "working" | "done" | "error";
-
+type Phase = "idle" | "working" | "preview" | "error";
 type StepState = "pending" | "active" | "done";
 type Step = { id: string; label: string; state: StepState; detail?: string };
 
 const BASE_STEPS: Step[] = [
   { id: "fetch", label: "Récupération de la transcription", state: "pending" },
-  { id: "write", label: "Réécriture éditoriale par chapitre", state: "pending" },
-  { id: "front", label: "Titre, sommaire et introduction", state: "pending" },
-  { id: "build", label: "Mise en page du livre", state: "pending" },
+  { id: "write", label: "Rédaction du premier chapitre", state: "pending" },
+  { id: "front", label: "Titre, sous-titre et introduction", state: "pending" },
 ];
+
+const PENDING_KEY = "podcastly:pending-book";
+
+type PendingBook = {
+  title: string;
+  subtitle: string;
+  author: string;
+  intro: string;
+  sourceUrl: string;
+  sourceTitle: string;
+  language: string;
+  coverUrl: string | null;
+  tone: ToneId;
+  targetLang: string | null;
+  chaptersTotal: number;
+  firstChapter: Chapter;
+  chunks: TranscriptChunk[];
+};
 
 function Home() {
   const runTranscript = useServerFn(getTranscript);
   const runChapter = useServerFn(writeChapter);
   const runFront = useServerFn(writeFrontMatter);
+  const runSave = useServerFn(saveBookFn);
+  const { user, loading: authLoading } = useAuth();
+  const router = useRouter();
 
   const [url, setUrl] = useState("");
   const [targetLang, setTargetLang] = useState("");
+  const [tone, setTone] = useState<ToneId>("entretien");
   const [phase, setPhase] = useState<Phase>("idle");
   const [steps, setSteps] = useState<Step[]>(BASE_STEPS);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const [book, setBook] = useState<Book | null>(null);
-  const [cover, setCover] = useState<string | null>(null);
-  const [exporting, setExporting] = useState<string | null>(null);
+  const [pending, setPending] = useState<PendingBook | null>(null);
+  const [unlocking, setUnlocking] = useState(false);
   const resultRef = useRef<HTMLDivElement>(null);
+  const restored = useRef(false);
 
   const patch = (id: string, state: StepState, detail?: string) =>
     setSteps((prev) =>
       prev.map((s) => (s.id === id ? { ...s, state, ...(detail ? { detail } : {}) } : s)),
     );
+
+  // Un aperçu généré avant connexion est repris automatiquement au retour.
+  useEffect(() => {
+    if (restored.current) return;
+    const raw = sessionStorage.getItem(PENDING_KEY);
+    if (!raw) return;
+    restored.current = true;
+    try {
+      const parsed = JSON.parse(raw) as PendingBook;
+      setPending(parsed);
+      setTone(parsed.tone);
+      setTargetLang(parsed.targetLang ?? "");
+      setPhase("preview");
+      setProgress(100);
+      setSteps(BASE_STEPS.map((s) => ({ ...s, state: "done" })));
+    } catch {
+      sessionStorage.removeItem(PENDING_KEY);
+    }
+  }, []);
 
   async function generate(e: React.FormEvent) {
     e.preventDefault();
@@ -78,63 +131,53 @@ function Home() {
 
     setPhase("working");
     setError(null);
-    setBook(null);
-    setCover(null);
-    setProgress(2);
+    setPending(null);
+    setProgress(4);
     setSteps(BASE_STEPS.map((s) => ({ ...s, state: "pending" })));
+    sessionStorage.removeItem(PENDING_KEY);
 
     try {
       patch("fetch", "active");
       const meta = await runTranscript({ data: { url } });
-      setCover(meta.thumbnail);
       patch(
         "fetch",
         "done",
         `${meta.title} · ${Math.round(meta.totalChars / 1000)} k caractères · ${meta.chunks.length} chapitre(s)`,
       );
-      setProgress(10);
+      setProgress(35);
 
-      patch("write", "active", `0 / ${meta.chunks.length}`);
-      const chapters: Chapter[] = [];
-      const speakers = new Set<string>();
-
-      for (const chunk of meta.chunks) {
-        const previous = chapters[chapters.length - 1];
-        const lastPara = previous?.paragraphs[previous.paragraphs.length - 1];
-        const chapter = await runChapter({
-          data: {
-            chunk: chunk.text,
-            index: chunk.index,
-            total: meta.chunks.length,
-            bookTitle: meta.title,
-            sourceLang: meta.lang,
-            targetLang: targetLang || null,
-            previousSpeakers: [...speakers].slice(0, 12),
-            previousEnding: (lastPara?.text ?? "").slice(-300),
-          },
-        });
-        chapter.paragraphs.forEach((p) => p.speaker && speakers.add(p.speaker));
-        chapters.push(chapter);
-        patch("write", "active", `${chapters.length} / ${meta.chunks.length} — « ${chapter.title} »`);
-        setProgress(10 + Math.round((chapters.length / meta.chunks.length) * 75));
-      }
-      patch("write", "done", `${chapters.length} chapitre(s) rédigé(s)`);
+      patch("write", "active");
+      const first = await runChapter({
+        data: {
+          chunk: meta.chunks[0]!.text,
+          index: 0,
+          total: meta.chunks.length,
+          bookTitle: meta.title,
+          sourceLang: meta.lang,
+          targetLang: targetLang || null,
+          tone,
+          previousSpeakers: [],
+          previousEnding: "",
+          knownTerms: [],
+        },
+      });
+      patch("write", "done", `« ${first.title} »`);
+      setProgress(75);
 
       patch("front", "active");
       const front = await runFront({
         data: {
           sourceTitle: meta.title,
           author: meta.author,
-          chapterTitles: chapters.map((c) => c.title),
-          excerpt: chapters[0]?.paragraphs.map((p) => p.text).join(" ") ?? "",
+          chapterTitles: [first.title],
+          excerpt: first.blocks.map((b) => b.text).join(" "),
           targetLang: targetLang || null,
+          tone,
         },
       });
       patch("front", "done", front.title);
-      setProgress(94);
 
-      patch("build", "active");
-      setBook({
+      const draft: PendingBook = {
         title: front.title,
         subtitle: front.subtitle,
         author: meta.author,
@@ -142,12 +185,21 @@ function Home() {
         sourceUrl: `https://www.youtube.com/watch?v=${meta.videoId}`,
         sourceTitle: meta.title,
         language: targetLang || meta.lang,
-        chapters,
-      });
-      patch("build", "done");
+        coverUrl: meta.thumbnail,
+        tone,
+        targetLang: targetLang || null,
+        chaptersTotal: meta.chunks.length,
+        firstChapter: first,
+        chunks: meta.chunks,
+      };
+      setPending(draft);
+      sessionStorage.setItem(PENDING_KEY, JSON.stringify(draft));
       setProgress(100);
-      setPhase("done");
-      setTimeout(() => resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 120);
+      setPhase("preview");
+      setTimeout(
+        () => resultRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
+        120,
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Une erreur inattendue est survenue.");
       setPhase("error");
@@ -155,44 +207,45 @@ function Home() {
     }
   }
 
-  async function exportFile(kind: "epub" | "pdf") {
-    if (!book) return;
-    setExporting(kind);
+  async function unlock() {
+    if (!pending) return;
+    if (!user) {
+      router.navigate({ href: "/auth?next=%2F" });
+      return;
+    }
+    setUnlocking(true);
+    setError(null);
     try {
-      const name = slugify(book.title);
-      if (kind === "epub") {
-        downloadBlob(buildEpub(book), `${name}.epub`);
-      } else {
-        downloadBlob(await buildPdf(book), `${name}.pdf`);
-      }
-    } catch {
-      setError("La génération du fichier a échoué. Réessaie.");
-    } finally {
-      setExporting(null);
+      const saved = await runSave({ data: pending });
+      sessionStorage.removeItem(PENDING_KEY);
+      router.navigate({ href: `/livre/${saved.id}` });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Impossible d'enregistrer ce livre.");
+      setUnlocking(false);
     }
   }
 
-  const wordCount = useMemo(
-    () =>
-      book
-        ? book.chapters.reduce(
-            (a, c) => a + c.paragraphs.reduce((b, p) => b + p.text.split(/\s+/).length, 0),
-            0,
-          )
-        : 0,
-    [book],
-  );
-
   const busy = phase === "working";
+
+  const previewBook: Book | null = pending
+    ? {
+        title: pending.title,
+        subtitle: pending.subtitle,
+        author: pending.author,
+        intro: pending.intro,
+        sourceUrl: pending.sourceUrl,
+        sourceTitle: pending.sourceTitle,
+        language: pending.language,
+        chapters: [pending.firstChapter],
+        glossary: mergeGlossary(pending.firstChapter.glossary),
+      }
+    : null;
 
   return (
     <main className="min-h-screen">
       <section className="surface-night relative overflow-hidden">
-        <div className="mx-auto w-full max-w-5xl px-5 pb-16 pt-10 sm:pt-14">
-          <header className="flex items-center gap-2 text-sm font-semibold tracking-tight">
-            <BookOpen className="h-5 w-5" strokeWidth={2.2} />
-            Podcastly
-          </header>
+        <div className="mx-auto w-full max-w-5xl px-5 pb-16 pt-8 sm:pt-10">
+          <SiteHeader dark />
 
           <div className="mx-auto mt-12 max-w-3xl text-center">
             <span className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/10 px-3 py-1 text-xs font-semibold uppercase tracking-widest">
@@ -202,8 +255,8 @@ function Home() {
               Votre épisode devient un livre.
             </h1>
             <p className="mx-auto mt-5 max-w-xl text-base leading-relaxed opacity-80 sm:text-lg">
-              Collez un lien YouTube. On récupère la transcription, on l'édite avec les mots exacts de
-              chaque intervenant, on traduit si vous le souhaitez, et vous repartez avec un eBook.
+              Collez un lien YouTube. Vous lisez le premier chapitre gratuitement, et vous ne payez{" "}
+              {formatPrice()} que si le résultat vous plaît.
             </p>
           </div>
 
@@ -221,6 +274,35 @@ function Home() {
               aria-label="Lien de la vidéo YouTube"
               className="w-full rounded-2xl border-0 bg-white/95 px-5 py-4 text-base text-foreground outline-none ring-accent placeholder:text-muted-foreground focus:ring-2 disabled:opacity-70"
             />
+
+            <fieldset className="mt-3 rounded-2xl bg-white/95 p-4 text-left">
+              <legend className="px-1 text-xs font-semibold uppercase tracking-widest text-muted-foreground">
+                Comment doit sonner votre livre ?
+              </legend>
+              <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                {TONES.map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => setTone(t.id)}
+                    disabled={busy}
+                    aria-pressed={tone === t.id}
+                    className={`rounded-xl border p-3 text-left transition-colors ${
+                      tone === t.id
+                        ? "border-accent bg-accent/10"
+                        : "border-border bg-background hover:bg-secondary"
+                    }`}
+                  >
+                    <p className="text-sm font-semibold text-foreground">{t.label}</p>
+                    <p className="text-xs font-medium text-accent">{t.tagline}</p>
+                    <p className="mt-1 text-xs leading-snug text-muted-foreground">
+                      {t.description}
+                    </p>
+                  </button>
+                ))}
+              </div>
+            </fieldset>
+
             <div className="mt-3 flex flex-col gap-3 sm:flex-row">
               <label className="flex flex-1 items-center gap-2 rounded-2xl bg-white/95 px-4 py-3">
                 <Languages className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -245,18 +327,18 @@ function Home() {
               >
                 {busy ? (
                   <>
-                    <Loader2 className="h-5 w-5 animate-spin" /> Génération…
+                    <Loader2 className="h-5 w-5 animate-spin" /> Lecture de l'épisode…
                   </>
                 ) : (
                   <>
-                    Générer mon eBook <ArrowRight className="h-5 w-5" />
+                    Voir mon aperçu gratuit <ArrowRight className="h-5 w-5" />
                   </>
                 )}
               </button>
             </div>
             <p className="px-2 pb-1 pt-3 text-xs opacity-70">
-              Fonctionne avec toute vidéo disposant de sous-titres, même automatiques. Gratuit, sans
-              inscription.
+              Fonctionne avec toute vidéo disposant de sous-titres, même automatiques. Aperçu
+              gratuit, puis {formatPrice()} par livre — paiement unique, sans abonnement.
             </p>
           </form>
         </div>
@@ -273,13 +355,13 @@ function Home() {
               },
               {
                 icon: Wand2,
-                title: "Édition, pas réécriture",
-                text: "Ponctuation, paragraphes et locuteurs identifiés. Les mots restent ceux des intervenants.",
+                title: "Confort de lecture",
+                text: "Quand un passage devient obscur, l'IA ajoute une transition, une note ou une définition — jamais une opinion.",
               },
               {
                 icon: Download,
                 title: "EPUB & PDF",
-                text: "Sommaire, chapitres et couverture. L'EPUB s'envoie directement à votre Kindle.",
+                text: "Sommaire, chapitres, notes et glossaire. L'EPUB s'envoie directement à votre Kindle.",
               },
             ].map((f) => (
               <div key={f.title} className="card-soft p-6">
@@ -291,11 +373,11 @@ function Home() {
           </div>
         )}
 
-        {(busy || phase === "error" || phase === "done") && (
+        {(busy || phase === "error") && (
           <div className="card-soft overflow-hidden p-6 sm:p-8">
             <div className="flex items-baseline justify-between gap-4">
               <h2 className="text-lg font-semibold">
-                {phase === "done" ? "Livre prêt" : phase === "error" ? "Traitement interrompu" : "Fabrication en cours"}
+                {phase === "error" ? "Traitement interrompu" : "Préparation de votre aperçu"}
               </h2>
               <span className="text-sm font-semibold tabular-nums text-muted-foreground">
                 {progress}%
@@ -329,15 +411,13 @@ function Home() {
                     >
                       {s.label}
                     </p>
-                    {s.detail && (
-                      <p className="truncate text-xs text-muted-foreground">{s.detail}</p>
-                    )}
+                    {s.detail && <p className="truncate text-xs text-muted-foreground">{s.detail}</p>}
                   </div>
                 </li>
               ))}
             </ul>
 
-            {error && (
+            {error && phase === "error" && (
               <div className="mt-6 flex items-start gap-3 rounded-2xl border border-destructive/30 bg-destructive/5 p-4">
                 <XCircle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
                 <div>
@@ -358,100 +438,82 @@ function Home() {
           </div>
         )}
 
-        {book && (
+        {previewBook && pending && (
           <div ref={resultRef} className="mt-8 grid gap-6 lg:grid-cols-[320px_1fr]">
             <aside className="card-soft h-fit overflow-hidden">
               <div className="surface-night flex aspect-[3/4] flex-col justify-between p-6">
-                {cover && (
+                {pending.coverUrl && (
                   <img
-                    src={cover}
+                    src={pending.coverUrl}
                     alt=""
                     aria-hidden="true"
                     className="h-24 w-full rounded-lg object-cover opacity-40"
                   />
                 )}
                 <div>
-                  <h3 className="font-display text-2xl font-bold leading-tight">{book.title}</h3>
-                  <p className="mt-2 text-sm italic opacity-80">{book.subtitle}</p>
-                  <p className="mt-6 text-xs uppercase tracking-widest opacity-70">{book.author}</p>
+                  <h3 className="font-display text-2xl font-bold leading-tight">{pending.title}</h3>
+                  <p className="mt-2 text-sm italic opacity-80">{pending.subtitle}</p>
+                  <p className="mt-6 text-xs uppercase tracking-widest opacity-70">
+                    {pending.author}
+                  </p>
                 </div>
               </div>
               <div className="space-y-3 p-5">
                 <p className="text-xs text-muted-foreground">
-                  {book.chapters.length} chapitres · ~{wordCount.toLocaleString("fr-FR")} mots
+                  Aperçu : chapitre 1 sur {pending.chaptersTotal} · ~
+                  {chapterWordCount(pending.firstChapter).toLocaleString("fr-FR")} mots lus
                 </p>
                 <button
-                  onClick={() => exportFile("epub")}
-                  disabled={exporting !== null}
+                  onClick={unlock}
+                  disabled={unlocking || authLoading}
                   className="cta hover:cta-hover flex w-full items-center justify-center gap-2 px-5 py-3.5 disabled:opacity-70"
                 >
-                  {exporting === "epub" ? (
+                  {unlocking ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
                   ) : (
-                    <Download className="h-4 w-4" />
+                    <Lock className="h-4 w-4" />
                   )}
-                  Télécharger en EPUB
-                </button>
-                <button
-                  onClick={() => exportFile("pdf")}
-                  disabled={exporting !== null}
-                  className="flex w-full items-center justify-center gap-2 rounded-lg border border-border bg-secondary px-5 py-3.5 text-sm font-semibold transition-colors hover:bg-muted disabled:opacity-70"
-                >
-                  {exporting === "pdf" ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <FileText className="h-4 w-4" />
-                  )}
-                  Télécharger en PDF
+                  Débloquer le livre — {formatPrice()}
                 </button>
                 <p className="text-xs leading-relaxed text-muted-foreground">
-                  Kindle : envoyez le fichier EPUB à votre adresse « Send to Kindle », Amazon le
-                  convertit automatiquement au format Kindle.
+                  Paiement unique, pas d'abonnement. Le livre complet reste dans votre bibliothèque
+                  et se retélécharge en EPUB ou PDF quand vous voulez.
                 </p>
+                {!user && !authLoading && (
+                  <p className="text-xs font-semibold text-accent">
+                    Un compte est créé en une minute pour conserver votre livre.
+                  </p>
+                )}
+                {error && phase === "preview" && (
+                  <p className="text-xs font-semibold text-destructive">{error}</p>
+                )}
               </div>
             </aside>
 
-            <article className="card-soft max-h-[720px] overflow-y-auto p-6 font-book sm:p-9">
-              <h2 className="font-display text-3xl font-bold">{book.title}</h2>
-              <p className="mt-2 italic text-muted-foreground">{book.subtitle}</p>
-              {book.intro
-                .split(/\n{2,}/)
-                .filter(Boolean)
-                .map((p, i) => (
-                  <p key={i} className="mt-4 leading-[1.75] text-muted-foreground">
-                    {p}
+            <div>
+              <BookReader book={previewBook} />
+              <div className="card-soft mt-4 flex flex-col items-start gap-3 border-accent/30 bg-accent/5 p-6 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="flex items-center gap-2 font-semibold">
+                    <BookOpen className="h-4 w-4 text-accent" />
+                    {pending.chaptersTotal - 1} chapitre(s) restant(s)
                   </p>
-                ))}
-              {book.chapters.map((ch, i) => (
-                <section key={i} className="mt-10 border-t border-border pt-8">
-                  <h3 className="font-display text-xl font-semibold">
-                    {i + 1}. {ch.title}
-                  </h3>
-                  {ch.paragraphs.map((p, j) => {
-                    const prev = ch.paragraphs[j - 1];
-                    const show = p.speaker && p.speaker !== prev?.speaker;
-                    return (
-                      <p key={j} className="mt-4 leading-[1.8]">
-                        {show && (
-                          <span className="mr-1 text-sm font-bold uppercase tracking-wide text-accent">
-                            {p.speaker} :
-                          </span>
-                        )}
-                        {p.text}
-                      </p>
-                    );
-                  })}
-                </section>
-              ))}
-            </article>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    On rédige la suite dès le paiement, puis vous téléchargez le livre entier.
+                  </p>
+                </div>
+                <button
+                  onClick={unlock}
+                  disabled={unlocking || authLoading}
+                  className="cta hover:cta-hover shrink-0 px-5 py-3 disabled:opacity-70"
+                >
+                  Continuer pour {formatPrice()}
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </div>
-
-      <footer className="border-t border-border py-8 text-center text-xs text-muted-foreground">
-        Podcastly · Transcriptions issues des sous-titres publics YouTube. Respectez les droits des
-        auteurs.
-      </footer>
     </main>
   );
 }
