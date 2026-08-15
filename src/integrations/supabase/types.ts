@@ -14,7 +14,137 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      books: {
+        Row: {
+          author: string
+          chapters: Json
+          chapters_total: number
+          cover_url: string | null
+          created_at: string
+          glossary: Json
+          id: string
+          intro: string
+          language: string
+          source_chunks: Json
+          source_title: string
+          source_url: string
+          status: string
+          subtitle: string
+          target_lang: string | null
+          title: string
+          tone: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          author?: string
+          chapters?: Json
+          chapters_total?: number
+          cover_url?: string | null
+          created_at?: string
+          glossary?: Json
+          id?: string
+          intro?: string
+          language?: string
+          source_chunks?: Json
+          source_title: string
+          source_url: string
+          status?: string
+          subtitle?: string
+          target_lang?: string | null
+          title: string
+          tone?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          author?: string
+          chapters?: Json
+          chapters_total?: number
+          cover_url?: string | null
+          created_at?: string
+          glossary?: Json
+          id?: string
+          intro?: string
+          language?: string
+          source_chunks?: Json
+          source_title?: string
+          source_url?: string
+          status?: string
+          subtitle?: string
+          target_lang?: string | null
+          title?: string
+          tone?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
+      orders: {
+        Row: {
+          amount_cents: number
+          book_id: string
+          created_at: string
+          currency: string
+          id: string
+          provider: string | null
+          provider_ref: string | null
+          status: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          amount_cents?: number
+          book_id: string
+          created_at?: string
+          currency?: string
+          id?: string
+          provider?: string | null
+          provider_ref?: string | null
+          status?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          amount_cents?: number
+          book_id?: string
+          created_at?: string
+          currency?: string
+          id?: string
+          provider?: string | null
+          provider_ref?: string | null
+          status?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "orders_book_id_fkey"
+            columns: ["book_id"]
+            isOneToOne: false
+            referencedRelation: "books"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      profiles: {
+        Row: {
+          created_at: string
+          email: string | null
+          id: string
+        }
+        Insert: {
+          created_at?: string
+          email?: string | null
+          id: string
+        }
+        Update: {
+          created_at?: string
+          email?: string | null
+          id?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
