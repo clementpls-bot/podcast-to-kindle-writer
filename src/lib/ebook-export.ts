@@ -1,5 +1,5 @@
 import { zipSync, strToU8 } from "fflate";
-import type { Book } from "./book-types";
+import type { Block, Book, Chapter } from "./book-types";
 
 function esc(s: string) {
   return s
@@ -21,12 +21,26 @@ export function slugify(s: string) {
   );
 }
 
+/** Remplace les appels de note [^1] par du texte lisible (PDF, aperçus). */
+export function plainFootnotes(text: string) {
+  return text.replace(/\[\^(\d+)\]/g, "[$1]");
+}
+
 const CSS = `body{font-family:serif;line-height:1.55;margin:1em;}
 h1{font-size:1.6em;margin:0 0 .2em;line-height:1.25;}
 h2{font-size:1.05em;font-weight:normal;font-style:italic;color:#444;margin:0 0 1.5em;}
 p{margin:0 0 .85em;text-align:justify;}
 .speaker{font-weight:bold;font-variant:small-caps;}
 .meta{color:#555;font-size:.9em;}
+.note{border-left:3px solid #d97706;background:#faf7f2;padding:.6em .9em;margin:1.1em 0;font-size:.94em;}
+.note .note-title{display:block;font-weight:bold;font-variant:small-caps;letter-spacing:.04em;margin-bottom:.3em;color:#8a5a08;}
+.note p{margin:0 0 .5em;text-align:left;font-style:italic;}
+.footnotes{margin-top:2em;border-top:1px solid #ccc;padding-top:.8em;font-size:.85em;color:#444;}
+.footnotes h3{font-size:.9em;font-variant:small-caps;letter-spacing:.06em;margin:0 0 .5em;}
+.footnotes p{text-align:left;margin:0 0 .4em;}
+sup a{text-decoration:none;color:#8a5a08;}
+dl.glossary dt{font-weight:bold;margin-top:.8em;}
+dl.glossary dd{margin:.15em 0 0 1em;color:#333;}
 nav ol{list-style:none;padding-left:0;}
 nav li{margin:.4em 0;}`;
 
@@ -38,10 +52,56 @@ function chapterHtml(title: string, body: string, lang: string) {
 <body>${body}</body></html>`;
 }
 
+function inline(text: string, chapterIndex: number) {
+  return esc(text).replace(
+    /\[\^(\d+)\]/g,
+    (_, n) => `<sup id="fnref${chapterIndex}-${n}"><a href="#fn${chapterIndex}-${n}">${n}</a></sup>`,
+  );
+}
+
+function blockHtml(block: Block, chapterIndex: number, showSpeaker: boolean) {
+  if (block.kind === "note") {
+    return `<div class="note">${
+      block.title ? `<span class="note-title">${esc(block.title)}</span>` : ""
+    }${block.text
+      .split(/\n{2,}/)
+      .filter(Boolean)
+      .map((p) => `<p>${inline(p, chapterIndex)}</p>`)
+      .join("")}</div>`;
+  }
+  return `<p>${
+    showSpeaker && block.speaker ? `<span class="speaker">${esc(block.speaker)} :</span> ` : ""
+  }${inline(block.text, chapterIndex)}</p>`;
+}
+
+function chapterBody(ch: Chapter, i: number) {
+  let last = "";
+  const body = ch.blocks
+    .map((b) => {
+      if (b.kind === "note") return blockHtml(b, i, false);
+      const show = !!b.speaker && b.speaker !== last;
+      last = b.speaker ?? last;
+      return blockHtml(b, i, show);
+    })
+    .join("");
+
+  const notes = ch.footnotes.length
+    ? `<div class="footnotes"><h3>Notes</h3>${ch.footnotes
+        .map(
+          (f) =>
+            `<p id="fn${i}-${f.n}"><a href="#fnref${i}-${f.n}">${f.n}.</a> ${esc(f.text)}</p>`,
+        )
+        .join("")}</div>`
+    : "";
+
+  return `<h1>${esc(ch.title)}</h1>${body}${notes}`;
+}
+
 export function buildEpub(book: Book): Blob {
   const lang = book.language || "fr";
   const uid = `urn:uuid:${crypto.randomUUID()}`;
   const files: Record<string, Uint8Array> = {};
+  const hasGlossary = book.glossary.length > 0;
 
   files["mimetype"] = strToU8("application/epub+zip");
   files["META-INF/container.xml"] = strToU8(
@@ -60,22 +120,19 @@ ${book.intro
   files["OEBPS/title.xhtml"] = strToU8(chapterHtml(book.title, titleBody, lang));
 
   book.chapters.forEach((ch, i) => {
-    let last = "";
-    const body =
-      `<h1>${esc(ch.title)}</h1>` +
-      ch.paragraphs
-        .map((p) => {
-          const showSpeaker = p.speaker && p.speaker !== last;
-          last = p.speaker ?? last;
-          return `<p>${showSpeaker ? `<span class="speaker">${esc(p.speaker!)} :</span> ` : ""}${esc(p.text)}</p>`;
-        })
-        .join("");
-    files[`OEBPS/chap${i + 1}.xhtml`] = strToU8(chapterHtml(ch.title, body, lang));
+    files[`OEBPS/chap${i + 1}.xhtml`] = strToU8(chapterHtml(ch.title, chapterBody(ch, i + 1), lang));
   });
+
+  if (hasGlossary) {
+    const body = `<h1>Glossaire</h1><dl class="glossary">${book.glossary
+      .map((g) => `<dt>${esc(g.term)}</dt><dd>${esc(g.definition)}</dd>`)
+      .join("")}</dl>`;
+    files["OEBPS/glossary.xhtml"] = strToU8(chapterHtml("Glossaire", body, lang));
+  }
 
   const navBody = `<h1>Sommaire</h1><nav epub:type="toc" id="toc"><ol>${book.chapters
     .map((ch, i) => `<li><a href="chap${i + 1}.xhtml">${esc(ch.title)}</a></li>`)
-    .join("")}</ol></nav>`;
+    .join("")}${hasGlossary ? `<li><a href="glossary.xhtml">Glossaire</a></li>` : ""}</ol></nav>`;
   files["OEBPS/nav.xhtml"] = strToU8(
     `<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
@@ -91,12 +148,16 @@ ${book.intro
     ...book.chapters.map(
       (_, i) => `<item id="c${i + 1}" href="chap${i + 1}.xhtml" media-type="application/xhtml+xml"/>`,
     ),
+    ...(hasGlossary
+      ? [`<item id="glossary" href="glossary.xhtml" media-type="application/xhtml+xml"/>`]
+      : []),
   ].join("");
 
   const spine = [
     `<itemref idref="title"/>`,
     `<itemref idref="nav"/>`,
     ...book.chapters.map((_, i) => `<itemref idref="c${i + 1}"/>`),
+    ...(hasGlossary ? [`<itemref idref="glossary"/>`] : []),
   ].join("");
 
   files["OEBPS/content.opf"] = strToU8(`<?xml version="1.0" encoding="utf-8"?>
@@ -164,6 +225,11 @@ export async function buildPdf(book: Book): Promise<Blob> {
       y += 16;
     });
   });
+  if (book.glossary.length) {
+    ensure(16);
+    doc.text("Glossaire", M, y);
+    y += 16;
+  }
 
   if (book.intro) {
     newPage();
@@ -188,23 +254,92 @@ export async function buildPdf(book: Book): Promise<Blob> {
     });
     y += 6;
     let last = "";
-    ch.paragraphs.forEach((p) => {
-      if (p.speaker && p.speaker !== last) {
-        last = p.speaker;
+
+    ch.blocks.forEach((b) => {
+      if (b.kind === "note") {
+        const inset = 12;
+        const lines = doc
+          .setFont("times", "italic")
+          .setFontSize(10)
+          .splitTextToSize(plainFootnotes(b.text), maxW - inset * 2) as string[];
+        const boxH = lines.length * 13 + (b.title ? 16 : 0) + 16;
+        ensure(boxH + 8);
+        const top = y - 4;
+        doc.setDrawColor(217, 119, 6).setLineWidth(2);
+        doc.line(M, top, M, top + boxH);
+        doc.setLineWidth(0.2);
+        y += 10;
+        if (b.title) {
+          doc.setFont("times", "bold").setFontSize(9);
+          doc.text(b.title.toUpperCase(), M + inset, y);
+          y += 14;
+        }
+        doc.setFont("times", "italic").setFontSize(10);
+        lines.forEach((l) => {
+          doc.text(l, M + inset, y);
+          y += 13;
+        });
+        y += 10;
+        doc.setDrawColor(0);
+        return;
+      }
+
+      if (b.speaker && b.speaker !== last) {
+        last = b.speaker;
         ensure(18);
         doc.setFont("times", "bold").setFontSize(10);
-        doc.text(p.speaker.toUpperCase(), M, y);
+        doc.text(b.speaker.toUpperCase(), M, y);
         y += 14;
       }
       doc.setFont("times", "normal").setFontSize(11);
-      doc.splitTextToSize(p.text, maxW).forEach((l: string) => {
+      doc.splitTextToSize(plainFootnotes(b.text), maxW).forEach((l: string) => {
         ensure(15);
         doc.text(l, M, y);
         y += 15;
       });
       y += 7;
     });
+
+    if (ch.footnotes.length) {
+      ensure(30);
+      y += 8;
+      doc.setDrawColor(180);
+      doc.line(M, y, M + 120, y);
+      doc.setDrawColor(0);
+      y += 14;
+      doc.setFont("times", "bold").setFontSize(9);
+      doc.text("NOTES", M, y);
+      y += 13;
+      doc.setFont("times", "normal").setFontSize(9);
+      ch.footnotes.forEach((f) => {
+        doc.splitTextToSize(`${f.n}. ${f.text}`, maxW).forEach((l: string) => {
+          ensure(12);
+          doc.text(l, M, y);
+          y += 12;
+        });
+      });
+    }
   });
+
+  if (book.glossary.length) {
+    newPage();
+    doc.setFont("times", "bold").setFontSize(16);
+    doc.text("Glossaire", M, y);
+    y += 26;
+    book.glossary.forEach((g) => {
+      ensure(28);
+      doc.setFont("times", "bold").setFontSize(11);
+      doc.text(g.term, M, y);
+      y += 14;
+      doc.setFont("times", "normal").setFontSize(10);
+      doc.splitTextToSize(g.definition, maxW - 12).forEach((l: string) => {
+        ensure(13);
+        doc.text(l, M + 12, y);
+        y += 13;
+      });
+      y += 8;
+    });
+  }
 
   return doc.output("blob");
 }
